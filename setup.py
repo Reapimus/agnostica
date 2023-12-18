@@ -20,8 +20,8 @@ setuptools.setup(
     long_description_content_type='text/markdown',
     url='https://github.com/reapimus/agnostica',
     project_urls={
-        'Documentation': '',
-        'Issue tracker': '',
+        'Documentation': 'https://github.com/Reapimus/agnostica',
+        'Issue tracker': 'https://github.com/Reapimus/agnostica/issues',
     },
     classifiers=[
         'Programming Language :: Python :: 3.11',
