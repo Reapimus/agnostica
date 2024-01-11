@@ -1,0 +1,724 @@
+"""This file contains code from guilded.py and discord.py, see LICENSE.txt for full license details."""
+from __future__ import annotations
+
+import datetime
+import inspect
+import itertools
+from operator import attrgetter
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, TypeVar, Union
+
+import agnostica.abc
+
+from .asset import Asset
+from .enums import SocialLinkType, try_enum
+from .permissions import Permissions
+from .role import Role
+from .utils import MISSING, Object, copy_doc
+
+if TYPE_CHECKING:
+    from .types.user import (
+        User as UserPayload,
+        ServerMember as ServerMemberPayload,
+        ServerMemberBan as ServerMemberBanPayload,
+    )
+    from .types.social_link import SocialLink as SocialLinkPayload
+
+    from .server import Server
+
+__all__ = (
+    'BanEntry',
+    'ClientUser',
+    'Member',
+    'MemberBan',
+    'SocialLink',
+    'User',
+)
+
+T = TypeVar('T', bound=type)
+
+class User(agnostica.abc.User, agnostica.abc.Messageable):
+    """Represents a user on a platform.
+    
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two users are equal.
+
+        .. describe:: x != y
+
+            Checks if two users are not equal.
+
+        .. describe:: hash(x)
+
+            Returns the user's hash.
+
+        .. describe:: str(x)
+
+            Returns the user's name.
+    """
+    def _update(self, data: UserPayload):
+        try:
+            self.badges: List[str] = data.pop('badges')
+        except KeyError:
+            pass
+
+        try:
+            self.tagline: str = data.pop('tagline')
+        except KeyError:
+            pass
+
+        try:
+            self.bio: str = data.pop('bio')
+        except KeyError:
+            pass
+
+        try:
+            self.subdomain: str = data.pop('subdomain')
+        except KeyError:
+            pass
+
+        try:
+            self.avatar: Asset = data.pop('avatar')
+        except KeyError:
+            pass
+
+        try:
+            self.banner: Asset = data.pop('banner')
+        except KeyError:
+            pass
+
+def flatten_user(cls: T) -> T:
+    for attr, value in itertools.chain(agnostica.abc.User.__dict__.items(), User.__dict__.items()):
+        # ignore private/special methods
+        if attr.startswith('_'):
+            continue
+
+        # don't override what we already have
+        if attr in cls.__dict__:
+            continue
+
+        # if it's a slotted attribute or a property, redirect it
+        # slotted members are implemented as member_descriptors in Type.__dict__
+        if not hasattr(value, '__annotations__'):
+            getter = attrgetter('_user.' + attr)
+            setattr(cls, attr, property(getter, doc=f'Equivalent to :attr:`User.{attr}`'))
+        else:
+            # Technically, this can also use attrgetter
+            # However I'm not sure how I feel about "functions" returning properties
+            # It probably breaks something in Sphinx.
+            # probably a member function by now
+            def generate_function(x):
+                # We want sphinx to properly show coroutine functions as coroutines
+                if inspect.iscoroutinefunction(value):
+
+                    async def general(self, *args, **kwargs):  # type: ignore
+                        return await getattr(self._user, x)(*args, **kwargs)
+
+                else:
+
+                    def general(self, *args, **kwargs):
+                        return getattr(self._user, x)(*args, **kwargs)
+
+                general.__name__ = x
+                return general
+
+            func = generate_function(attr)
+            func = copy_doc(value)(func)
+            setattr(cls, attr, func)
+
+    return cls
+
+@flatten_user
+class Member(User):
+    """Represents a member of a :class:`.Server`.
+
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two members are equal.
+            Note that this works with :class:`~guilded.User` instances too.
+
+        .. describe:: x != y
+
+            Checks if two members are not equal.
+            Note that this works with :class:`~guilded.User` instances too.
+
+        .. describe:: hash(x)
+
+            Returns the member's hash.
+
+        .. describe:: str(x)
+
+            Returns the member's name.
+
+    Attributes
+    -----------
+    joined_at: Optional[:class:`datetime.datetime`]
+        When the member joined their server.
+        This may be ``None`` if the member object was partial.
+    nick: Optional[:class:`str`]
+        The member's nickname, if any.
+    xp: Optional[:class:`int`]
+        The member's XP. If this is ``None``, do not assume ``0``.
+    """
+
+    __slots__ = (
+        '_state',
+        '_role_ids',
+        '_user'
+        '_server',
+        'nick',
+        'xp',
+        'joined_at',
+        'colour',
+    )
+
+    if TYPE_CHECKING:
+        id: str
+        name: str
+        created_at: datetime.datetime
+        default_avatar: Asset
+        avatar: Optional[Asset]
+        dm_channel: Optional[agnostica.abc.Messageable]
+        banner: Optional[Asset]
+
+    def __init__(self, *, state, data: ServerMemberPayload, **extra):
+        self._state = state
+        self._user = User(state=state, data=data)
+        state._users[self._user.id] = self._user
+
+        self._server = extra.get('server')
+        self.server_id: str = self._server.id if self._server else data.get('serverId') or data.get('teamId')
+
+        self._role_ids: Set[int] = set(data.get('roleIds') or [])
+        self._owner: Optional[bool] = data.get('isOwner')
+        self.nick: Optional[str] = data.get('nickname')
+        self.joined_at: datetime.datetime = data.get('joinedAt')
+        self.xp: Optional[int] = data.get('xp')
+
+    def __repr__(self) -> str:
+        return f'<Member id={self._user.id!r} name={self._user.name!r} type={self._user._user_type!r} server={self.server!r}>'
+
+    def __str__(self) -> str:
+        return str(self._user)
+
+    @property
+    def server(self) -> Server:
+        """:class:`.Server`: The server that this member is from."""
+        return self._server or self._state._get_server(self.server_id)
+
+    @property
+    def guild(self) -> Server:
+        """This is an alias of :attr:`.server`. """
+        return self.server
+
+    @property
+    def roles(self) -> List[Role]:
+        """List[:class:`.Role`]: The cached list of roles that this member has."""
+        roles = [
+            self.server.get_role(int(role_id))
+            for role_id in self._role_ids
+            if self.server.get_role(int(role_id)) is not None
+        ]
+        return roles
+
+    @property
+    def server_permissions(self) -> Permissions:
+        """:class:`.Permissions`: The server-level permissions that this
+        member has.
+
+        This only considers the permissions immediately granted by the
+        member's roles and not any channel permission overwrites.
+
+        This does take into consideration server ownership.
+        """
+        if self.is_owner():
+            return Permissions.all()
+
+        values: List[str] = []
+        for role in self.roles:
+            values += role.permissions.values
+
+        return Permissions(*set(values))
+
+    @property
+    def guild_permissions(self) -> Permissions:
+        """:class:`.Permissions`: |dpyattr|
+
+        This is an alias of :attr:`.server_permissions`.
+        """
+        return self.server_permissions
+
+    @classmethod
+    def _copy(cls, member: Member):
+        self = cls.__new__(cls)
+
+        self._user = member._user
+        self._role_ids = member._role_ids.copy()
+        self._state = member._state
+        self._platform = member._platform
+        self._server = member._server
+        self.server_id = member.server_id
+
+        self.nick = member.nick
+        self.joined_at = member.joined_at
+        self._owner = member._owner
+
+        return self
+
+    def _update(self, data: ServerMemberPayload):
+        try:
+            self.nick = data.pop('nickname')
+        except KeyError:
+            pass
+
+        super()._update(data)
+
+    def _update_roles(self, role_ids: List[int]):
+        self._role_ids = {int(role_id) for role_id in role_ids}
+
+    def _update_xp(self, xp: int):
+        self.xp = xp
+
+    def is_owner(self) -> bool:
+        """:class:`bool`: Whether this member is the owner of their server.
+
+        This may incorrectly be ``False`` when the member and server are both partial.
+        """
+        if self._owner is not None:
+            return self._owner
+        return self.server.owner_id == self.id
+
+    async def set_nickname(self, nickname: Optional[str], /) -> Optional[str]:
+        """|coro|
+
+        Set this member's nickname. Use ``None`` to remove their nickname.
+
+        Returns
+        --------
+        Optional[:class:`str`]
+            The member's nickname after the operation.
+
+        Raises
+        -------
+        NotFound
+            This member does not exist.
+        Forbidden
+            You are not allowed to edit this member's nickname.
+            You can never edit a member who is above you in the role hierarchy.
+        HTTPException
+            Failed to set this member's nickname.
+        """
+        if nickname is None:
+            await self._platform.delete_member_nickname(self.server.id, self.id)
+        else:
+            data = await self._platform.update_member_nickname(self.server.id, self.id, nickname)
+            return data['nickname']  # In case it was modified silently
+
+    async def edit(
+        self,
+        *,
+        nick: Optional[str] = MISSING,
+        roles: List[Role] = MISSING,
+        xp: int = MISSING,
+        **kwargs,
+    ) -> None:
+        """|coro|
+
+        Edit this member.
+
+        Depending on the parameters provided, this method requires different permissions:
+
+        +-----------------+--------------------------------------+
+        |   Parameter     |              Permission              |
+        +-----------------+--------------------------------------+
+        | nick            | :attr:`Permissions.manage_nicknames` |
+        +-----------------+--------------------------------------+
+        | roles           | :attr:`Permissions.manage_roles`     |
+        +-----------------+--------------------------------------+
+        | xp              | :attr:`Permissions.manage_server_xp` |
+        +-----------------+--------------------------------------+
+
+        All parameters are optional.
+
+        Parameters
+        -----------
+        nick: :class:`str`
+            A new nickname. Use ``None`` to remove their nickname.
+        roles: List[:class:`.Role`]
+            The member's new list of roles. This *replaces* the roles.
+            Providing this parameter causes your client to make multiple API requests.
+        xp: :class:`int`
+            The member's new total XP.
+
+        Raises
+        -------
+        NotFound
+            This member does not exist.
+        Forbidden
+            You are not allowed to edit this member.
+            You can never edit a member who is above you in the role hierarchy.
+        HTTPException
+            Failed to edit this member.
+        """
+
+        if nick is not MISSING:
+            await self.set_nickname(nick)
+
+        if roles is not MISSING:
+            new_role_ids = [role.id for role in roles]
+            current_role_ids = await self.fetch_role_ids()
+
+            # Add new roles
+            for role in roles:
+                if role.id not in current_role_ids:
+                    await self.add_role(role)
+
+            # Remove roles not passed
+            for role_id in current_role_ids:
+                if role_id not in new_role_ids:
+                    await self.remove_role(Object(role_id))
+
+        if xp is not MISSING:
+            await self.set_xp(xp)
+
+    async def ban(self, **kwargs) -> MemberBan:
+        """|coro|
+
+        Ban this member. Equivalent to :meth:`Server.ban`.
+        """
+        return await self.server.ban(self, **kwargs)
+
+    async def unban(self) -> None:
+        """|coro|
+
+        Unban this member. Equivalent to :meth:`Server.unban`.
+        """
+        await self.server.unban(self)
+
+    async def kick(self) -> None:
+        """|coro|
+
+        Kick this member. Equivalent to :meth:`Server.kick`.
+        """
+        return await self.server.kick(self)
+
+    async def add_role(self, role: Role) -> None:
+        """|coro|
+
+        Add a role to this member.
+
+        Parameters
+        -----------
+        role: :class:`.Role`
+            The role to give this member.
+        """
+
+        await self._platform.assign_role_to_member(self.server.id, self.id, role.id)
+        self._role_ids.add(role.id)
+
+    async def add_roles(self, *roles: Role) -> None:
+        """|coro|
+
+        |dpyattr|
+
+        Add roles to this member.
+
+        Parameters
+        -----------
+        roles: List[:class:`.Role`]
+            The roles to add to the member.
+        """
+
+        for role in roles:
+            await self.add_role(role)
+
+    async def remove_role(self, role: Role) -> None:
+        """|coro|
+
+        Remove a role from this member.
+
+        Parameters
+        -----------
+        role: :class:`.Role`
+            The role to remove from member.
+        """
+
+        await self._platform.remove_role_from_member(self.server.id, self.id, role.id)
+        self._role_ids.discard(role.id)
+
+    async def remove_roles(self, *roles: Role) -> None:
+        """|coro|
+
+        |dpyattr|
+
+        Remove roles from this member.
+
+        Parameters
+        -----------
+        roles: List[:class:`.Role`]
+            The roles to remove from the member.
+        """
+
+        for role in roles:
+            await self.remove_role(role)
+
+    async def fetch_role_ids(self) -> List[int]:
+        """|coro|
+
+        Fetch the list of role IDs assigned to this member.
+
+        Returns
+        --------
+        List[:class:`int`]
+            The IDs of the roles that the member has.
+        """
+
+        data = await self._platform.get_member_roles(self.server.id, self.id)
+        return data['roleIds']
+
+    async def fetch_social_link(self, social_link_type: SocialLinkType, /) -> SocialLink:
+        """|coro|
+
+        Fetch one of this member's social links.
+
+        Parameters
+        -----------
+        social_link_type: :class:`SocialLinkType`
+            The type of social link to get.
+
+        Returns
+        --------
+        :class:`SocialLink`
+            The member's social link on the external service.
+
+        Raises
+        -------
+        TypeError
+            A :class:`SocialLinkType` was not passed to ``social_link_type``.
+        NotFound
+            The member does not have social link of the requested type.
+        HTTPException
+            Failed to retrieve the social link.
+        """
+
+        if not isinstance(social_link_type, SocialLinkType):
+            raise TypeError('social_link_type must be SocialLinkType, not %s' % social_link_type.__class__.__name__)
+
+        data = await self._platform.get_member_social_links(self.server.id, self.id, social_link_type.value)
+        return SocialLink(self, data['socialLink'])
+
+    async def award_xp(self, amount: int, /) -> int:
+        """|coro|
+
+        Award XP to this member.
+
+        .. note::
+
+            This method *modifies* the current value, it does not replace it.
+            To set total XP, use :meth:`~Member.set_xp`.
+
+        Parameters
+        -----------
+        amount: :class:`int`
+            The amount of XP to award.
+            Could be a negative value to remove XP.
+
+        Returns
+        --------
+        :class:`int`
+            The total amount of XP this member has after the operation.
+        """
+
+        data = await self._platform.award_member_xp(self.server.id, self.id, amount)
+        self.xp = data['total']
+        return self.xp
+
+    async def set_xp(self, total: int, /) -> int:
+        """|coro|
+
+        Set this member's total XP.
+
+        .. note::
+
+            This method *replaces* the current value.
+            To add or subtract XP, use :meth:`~Member.award_xp`.
+
+        Parameters
+        -----------
+        total: :class:`int`
+            The total amount of XP this member should have.
+
+        Returns
+        --------
+        :class:`int`
+            The total amount of XP this member has after the operation.
+        """
+
+        data = await self._platform.set_member_xp(self.server.id, self.id, total)
+        self.xp = data['total']
+        return self.xp
+
+    async def fetch_permissions(self) -> Permissions:
+        """|coro|
+
+        Fetch this member's server permissions.
+
+        Returns
+        --------
+        :class:`.Permissions`
+            The permissions that this member has.
+
+        Raises
+        -------
+        NotFound
+            The member does not exist.
+        HTTPException
+            Failed to fetch the member's permissions.
+        """
+
+        data = await self._platform.get_member_permissions(
+            self.server.id,
+            self.id,
+            # ids=require.values if require is not MISSING else None,
+        )
+        return Permissions(*data['permissions'])
+
+class MemberBan:
+    """Represents a ban created in a :class:`.Server`.
+
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two bans are equal.
+
+        .. describe:: x != y
+
+            Checks if two bans are not equal.
+
+    Attributes
+    -----------
+    user: Union[:class:`.Member`, :class:`.User`]
+        The user that is banned.
+    reason: Optional[:class:`str`]
+        The reason for the ban.
+    created_at: :class:`datetime.datetime`
+        When the ban was created.
+    server: :class:`.Server`
+        The server that the ban is in.
+    author_id: :class:`str`
+        The user's ID who created the ban.
+    """
+
+    __slots__ = (
+        '_state',
+        'server',
+        'user',
+        'reason',
+        'created_at',
+        'author_id',
+    )
+
+    def __init__(self, *, state, data: ServerMemberBanPayload, server: Server):
+        self._state = state
+        self.server = server
+
+        self.user: Union[Member, User] = state.create_user(data=data['user'])
+        self.reason: Optional[str] = data.get('reason')
+        self.created_at: datetime.datetime = data.get('createdAt')
+        self.author_id: str = data.get('bannedBy', data.get('createdBy'))
+
+    def __repr__(self) -> str:
+        return f'<MemberBan user={self.user!r} server={self.server!r}>'
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, MemberBan) and other.server == self.server and other.user == self.user
+
+    @property
+    def author(self) -> Optional[Member]:
+        """Optional[:class:`.Member`]: The user who created the ban."""
+        return self.server.get_member(self.author_id)
+
+    @property
+    def guild(self) -> Server:
+        """This is an alias of :attr:`.server`."""
+        return self.server
+
+    async def revoke(self) -> None:
+        """|coro|
+
+        Revoke this ban; unban the user it was created for.
+
+        This is equivalent to :meth:`.Server.unban`.
+        """
+        await self.server.unban(self.user)
+
+BanEntry = MemberBan  # discord.py
+
+class SocialLink:
+    """Represents a social link on a user's profile.
+
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two social links are equal.
+
+        .. describe:: x != y
+
+            Checks if two social links are not equal.
+
+    Attributes
+    -----------
+    user: Union[:class:`Member`, :class:`~agnostica.User`]
+        The social link's parent member or user.
+    user_id: :class:`str`
+        The ID of the social link's parent user.
+    type: :class:`SocialLinkType`
+        The type or platform that the social link is for.
+    handle: Optional[:class:`str`]
+        The member's handle on the external platform.
+    service_id: Optional[:class:`str`]
+        The member's ID on the external platform.
+    created_at: :class:`datetime.datetime`
+        When the social link was created.
+    """
+
+    __slots__: Tuple[str, ...] = (
+        'user',
+        'user_id',
+        'type',
+        'handle',
+        'service_id',
+        'created_at',
+    )
+
+    def __init__(self, user: Union[Member, User], data: SocialLinkPayload) -> None:
+        self.user = user
+        self.user_id = data.get('userId')
+        self.type = try_enum(SocialLinkType, data['type'])
+        self.handle = data.get('handle')
+        self.service_id = data.get('serviceId')
+        self.created_at = data.get('createdAt')
+
+    def __eq__(self, other: object):
+        return (
+            isinstance(other, SocialLink)
+            and self.user == other.user
+            and self.type == other.type
+        )
+
+    def __repr__(self) -> str:
+        return f'<SocialLink type={self.type!r} handle={self.handle!r} service_id={self.service_id!r} user={self.user!r}>'
+
+class ClientUser(agnostica.abc.User):
+    """Represents the current logged-in user."""
+
+    def __init__(self, *, state, data: UserPayload):
+        super().__init__(state=state, data=data)
+
+    def __repr__(self):
+        return f'<ClientUser id={self.id!r} bot_id={self.bot_id!r} name={self.name!r}>'

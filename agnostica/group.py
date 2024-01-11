@@ -1,0 +1,279 @@
+"""This file contains code from guilded.py and discord.py, see LICENSE.txt for full license details."""
+from __future__ import annotations
+
+import datetime
+from typing import TYPE_CHECKING, Optional, Tuple
+
+from .asset import Asset
+from .mixins import Hashable
+from .utils import MISSING
+from .globals import platform
+
+if TYPE_CHECKING:
+    from .category import Category
+    from .emote import Emote
+    from .server import Server
+    from .user import Member
+
+    from .types.group import Group as GroupPayload
+
+__all__ = (
+    'Group',
+)
+
+class Group(Hashable):
+    """Represents a server group on a platform.
+
+    .. container:: operations
+
+        .. describe:: x == y
+
+            Checks if two groups are equal.
+
+        .. describe:: x != y
+
+            Checks if two groups are not equal.
+
+        .. describe:: hash(x)
+
+            Returns the group's hash.
+
+        .. describe:: str(x)
+
+            Returns the name of the group.
+
+    Attributes
+    -----------
+    server: :class:`.Server`
+        The server that the group is in.
+    id: :class:`str`
+        The group's id.
+    name: :class:`str`
+        The group's name.
+    description: Optional[:class:`str`]
+        The group's description.
+    home: :class:`bool`
+        Whether the group is the home group of its server.
+    public: :class:`bool`
+        Whether the group is able to be joined by anyone.
+    emote_id: Optional[:class:`int`]
+        The ID of the emote associated with the group, if any.
+    created_at: :class:`datetime.datetime`
+        When the group was created.
+    updated_at: Optional[:class:`datetime.datetime`]
+        When the group was last updated.
+    archived_at: Optional[:class:`datetime.datetime`]
+        When the group was archived, if applicable.
+    """
+
+    __slots__: Tuple[str, ...] = (
+        '_state',
+        '_platform',
+        'server',
+        'server_id',
+        'id',
+        'name',
+        'description',
+        'home',
+        'public',
+        'emote_id',
+        'author_id',
+        'updated_by_id',
+        'archived_by_id',
+        'created_at',
+        'updated_at',
+        'archived_at',
+        '_avatar',
+    )
+
+    def __init__(self, *, state, _platform, data: GroupPayload, server: Server):
+        self._platform = _platform or platform
+        self._state = state
+        self.server = server
+        self.server_id: str = data.get('serverId')
+
+        self.id: str = data['id']
+        self.name: str = data.get('name')
+        self.description: str = data.get('description') or ''
+
+        self.home: bool = data.get('isHome') or False
+        self.public: bool = data.get('isPublic') or False
+
+        self.emote_id: Optional[int] = data.get('emoteId')
+        self.author_id: Optional[str] = data.get('createdBy')
+        self.updated_by_id: Optional[str] = data.get('updatedBy')
+        self.archived_by_id: Optional[str] =  data.get('archivedBy')
+
+        self.created_at: datetime.datetime = data.get('createdAt')
+        self.updated_at: Optional[datetime.datetime] = data.get('updatedAt')
+        self.archived_at: Optional[datetime.datetime] = data.get('archivedAt')
+        self._avatar: Optional[Asset] = data.get('avatar')
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return f'<Group id={self.id!r} name={self.name!r} server_id={self.server_id!r}>'
+
+    @property
+    def archived(self) -> bool:
+        """:class:`bool`: Whether this group is archived."""
+        return self.archived_at is not None
+
+    @property
+    def display_avatar(self) -> Optional[Asset]:
+        """Optional[:class:`.Asset`]: The group's displayed avatar.
+        If :attr:`.home` is ``True``, this will be the :attr:`.server`\'s avatar instead."""
+
+        if self.home:
+            return self._avatar or self.server.avatar
+
+        return self._avatar
+
+    @property
+    def author(self) -> Optional[Member]:
+        """Optional[:class:`.Member`]: The member who created the group."""
+        return self.server.get_member(self.author_id)
+
+    @property
+    def updated_by(self) -> Optional[Member]:
+        """Optional[:class:`.Member`]: The member who last updated the group, if any."""
+        return self.server.get_member(self.updated_by_id)
+
+    @property
+    def archived_by(self) -> Optional[Member]:
+        """Optional[:class:`.Member`]: The member who archived the group, if any."""
+        return self.server.get_member(self.archived_by_id)
+
+    async def edit(
+        self,
+        *,
+        name: Optional[str] = MISSING,
+        description: Optional[str] = MISSING,
+        emote: Optional[Emote] = MISSING,
+        public: bool = MISSING,
+    ) -> Group:
+        """|coro|
+
+        Edit the group.
+
+        All parameters are optional.
+
+        Parameters
+        -----------
+        name: :class:`str`
+            The name of the group.
+        description: :class:`str`
+            The description of the group.
+        emote: :class:`.Emote`
+            The emote associated with the group.
+        public: :class:`bool`
+            Whether the group is public.
+
+        Raises
+        -------
+        HTTPException
+            Editing the group failed.
+        Forbidden
+            You do not have permissions to edit the group.
+
+        Returns
+        --------
+        :class:`Group`
+            The newly edited group.
+        """
+
+        payload = {}
+
+        if name is not MISSING:
+            payload['name'] = name
+
+        if description is not MISSING:
+            payload['description'] = description
+
+        if emote is not MISSING:
+            emote_id: int = getattr(emote, 'id', emote)
+            payload['emoteId'] = emote_id
+
+        if public is not MISSING:
+            payload['isPublic'] = public
+
+        data = await self._platform.update_group(
+            self.server_id,
+            self.id,
+            payload=payload
+        )
+
+        group = Group(state=self._state, _platform=self._platform, data=data, server=self.server)
+        return group
+
+    async def delete(self) -> None:
+        """|coro|
+
+        Delete the group.
+
+        Raises
+        -------
+        HTTPException
+            Deleting the group failed.
+        Forbidden
+            You do not have permissions to delete the group.
+        """
+        await self._platform.delete_group(self.server_id, self.id)
+
+    async def add_member(self, member: Member, /) -> None:
+        """|coro|
+
+        Add a member to this group.
+
+        Raises
+        -------
+        NotFound
+            This group has been deleted or the member does not exist.
+        Forbidden
+            You do not have permission to add the member to this group.
+        HTTPException
+            Failed to add the member to this group.
+        """
+        await self._platform.add_group_member(self.id, member.id)
+
+    async def remove_member(self, member: Member, /) -> None:
+        """|coro|
+
+        Remove a member from this group.
+
+        Raises
+        -------
+        NotFound
+            This group has been deleted or the member does not exist.
+        Forbidden
+            You do not have permission to remove the member from this group.
+        HTTPException
+            Failed to remove the member from this group.
+        """
+        await self._platform.remove_group_member(self.id, member.id)
+
+    async def create_category(self, name: str) -> Category:
+        """|coro|
+
+        Create a new category in the group.
+
+        Parameters
+        -----------
+        name: :class:`str`
+            The category's name.
+
+        Returns
+        --------
+        :class:`.Category`
+            The created category.
+        """
+
+        from .category import Category
+
+        data = await self._platform.create_category(
+            self.server_id,
+            name=name,
+            group_id=self.id,
+        )
+        return Category(state=self._state, data=data, group=self, server=self.server)
